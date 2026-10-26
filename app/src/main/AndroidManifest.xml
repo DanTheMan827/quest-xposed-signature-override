@@ -1,9 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:label="SigningInfo Override" android:allowBackup="false">
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <application android:label="Signature Overrides" android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@android:style/Theme.Material.NoActionBar" android:requestLegacyExternalStorage="true">
         <meta-data android:name="xposedmodule" android:value="true" />
-        <meta-data android:name="xposeddescription"
-            android:value="Override Horizon signature lookup from SD-card package/version configuration" />
+        <meta-data android:name="xposeddescription" android:value="Per-package, per-version public signing certificate overrides" />
         <meta-data android:name="xposedminversion" android:value="82" />
+        <provider android:name=".OverrideProvider"
+            android:authorities="${applicationId}.certificates" android:exported="true" />
+        <activity android:name=".MainActivity" android:exported="true"
+            android:screenOrientation="sensorLandscape" android:resizeableActivity="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
     </application>
 </manifest>

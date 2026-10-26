@@ -1,9 +1,0 @@
-{
-  "overrides": [
-    {
-      "packageName": "com.beatgames.beatsaber",
-      "versionCode": 3237,
-      "certificateFile": "certificates/beatsaber.pem"
-    }
-  ]
-}

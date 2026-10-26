@@ -1,188 +1,139 @@
 package com.example.signinginfooverride;
 
 import android.content.Context;
+import android.net.Uri;
+import android.os.Bundle;
 import android.content.pm.PackageInfo;
-import android.os.Process;
-import android.util.Log;
+import android.content.pm.Signature;
+import android.content.pm.SigningInfo;
+import android.os.Parcel;
+import java.io.File;
 import java.lang.reflect.Constructor;
-import java.lang.reflect.Member;
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
 import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/** Direct hook for the AppVerifierUtils implementation inspected in Horizon.zip. */
-public final class SigningHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
-    static {
-        Log.i("SigningInfoOverride", "SigningHook class initialized; pid=" + Process.myPid());
-    }
+/** Changes only package-query results in explicitly scoped client processes. */
+public final class SigningHook implements IXposedHookLoadPackage {
     private static boolean installed;
+    private static volatile boolean verboseLogging;
+    private static final ThreadLocal<Boolean> inQuery = new ThreadLocal<>();
 
-    public SigningHook() {
-        log("SigningHook constructor; pid=" + Process.myPid());
+    @Override public synchronized void handleLoadPackage(XC_LoadPackage.LoadPackageParam p) {
+        // Never capture substituted results or modify the system package database.
+        if (installed || BuildConfig.APPLICATION_ID.equals(p.packageName) || "android".equals(p.packageName)) return;
+        Class<?> manager = XposedHelpers.findClassIfExists("android.app.ApplicationPackageManager", p.classLoader);
+        if (manager == null) return;
+        XC_MethodHook hook = new XC_MethodHook() {
+            @Override protected void afterHookedMethod(MethodHookParam param) {
+                // Provider resolution can itself query package metadata. Leave those nested calls alone.
+                if (Boolean.TRUE.equals(inQuery.get())) return;
+                inQuery.set(true);
+                try {
+                    refreshLogging();
+                    if (param.hasThrowable()) {
+                        log(param.method.getName() + " failed: " + param.getThrowable().getClass().getSimpleName());
+                        return;
+                    }
+                    log("Query: " + param.method.getName());
+                    Object original = param.getResult();
+                    if (original instanceof PackageInfo) {
+                        param.setResult(replace((PackageInfo) original));
+                    } else if (original instanceof List<?>) {
+                        List<Object> copy = new ArrayList<>((List<?>) original);
+                        log("Package list size=" + copy.size());
+                        for (int i = 0; i < copy.size(); i++) {
+                            if (copy.get(i) instanceof PackageInfo) copy.set(i, replace((PackageInfo) copy.get(i)));
+                        }
+                        param.setResult(copy);
+                    }
+                } finally { inQuery.remove(); }
+            }
+        };
+        for (String name : new String[]{"getPackageInfo", "getInstalledPackages", "getPackagesHoldingPermissions"}) {
+            XposedBridge.hookAllMethods(manager, name, hook);
+        }
+        installed = true;
     }
 
-    @Override public void initZygote(StartupParam param) {
-        log("SigningHook initZygote callback; pid=" + Process.myPid());
+    @SuppressWarnings("deprecation")
+    private static PackageInfo replace(PackageInfo original) {
+        if (original.packageName == null || BuildConfig.APPLICATION_ID.equals(original.packageName)) return original;
+        try {
+            byte[] pem = certificate(original.packageName, original.getLongVersionCode());
+            if (pem == null) {
+                log("No readable override for " + original.packageName + "+" + original.getLongVersionCode());
+                return original;
+            }
+            List<java.security.cert.X509Certificate> certificates = OverrideFiles.certificates(pem);
+            Signature[] replacements = new Signature[certificates.size()];
+            for (int i = 0; i < replacements.length; i++) replacements[i] = new Signature(certificates.get(i).getEncoded());
+            PackageInfo copy;
+            Parcel parcel = Parcel.obtain();
+            try {
+                original.writeToParcel(parcel, 0);
+                parcel.setDataPosition(0);
+                copy = PackageInfo.CREATOR.createFromParcel(parcel);
+            } finally { parcel.recycle(); }
+            if (copy.signatures != null) copy.signatures = replacements;
+            if (copy.signingInfo != null) copy.signingInfo = signingInfo(copy.signingInfo, replacements);
+            log("Applied override for " + original.packageName + "+" + original.getLongVersionCode()
+                    + "; current signers=" + replacements.length);
+            return copy;
+        } catch (Throwable error) {
+            log("Lookup failed for " + original.packageName + ": " + error);
+            return original;
+        }
+    }
+
+    private static byte[] certificate(String packageName, long version) throws Exception {
+        String filename = OverrideFiles.filename(packageName, version);
+        File file = OverrideFiles.resolve(new File(BuildConfig.OVERRIDE_DIRECTORY), filename);
+        try { if (file.isFile()) { log("Reading PEM directly: " + filename); return OverrideFiles.read(file); } }
+        catch (java.io.IOException | SecurityException denied) { /* Try manager's read-only bridge. */ }
+        Context context = currentContext();
+        if (context == null) return null;
+        log("Reading PEM through companion: " + filename);
+        Bundle result = context.getContentResolver().call(
+                Uri.parse("content://" + BuildConfig.APPLICATION_ID + ".certificates"),
+                "certificate", filename, null);
+        return result == null ? null : result.getByteArray("pem");
+    }
+
+    private static Context currentContext() {
+        return (Context) XposedHelpers.callStaticMethod(
+                XposedHelpers.findClass("android.app.ActivityThread", null), "currentApplication");
+    }
+
+    private static void refreshLogging() {
+        // Re-read for each query so the switch works in already-running scoped apps.
+        // Missing settings, a missing companion or IPC failure always disables logging.
+        try {
+            Context context = currentContext();
+            Bundle settings = context == null ? null : context.getContentResolver().call(
+                    Uri.parse("content://" + BuildConfig.APPLICATION_ID + ".certificates"), "settings", null, null);
+            verboseLogging = settings != null && settings.getBoolean(ModuleSettings.VERBOSE_LOGGING, false);
+        } catch (Throwable unavailable) { verboseLogging = false; }
     }
 
     private static void log(String message) {
-        Log.i("SigningInfoOverride", message);
-        XposedBridge.log("SigningInfoOverride: " + message);
+        if (verboseLogging) XposedBridge.log("SigningInfoOverride: " + message);
     }
 
-    @Override public synchronized void handleLoadPackage(XC_LoadPackage.LoadPackageParam p) {
-        log("v2.2 load-package callback; package=" + p.packageName + "; process=" + p.processName +
-                "; pid=" + Process.myPid());
-        if (installed) {
-            log("Hook already installed in this process");
-            return;
-        }
-        try {
-            Class<?> verifier = XposedHelpers.findClassIfExists(
-                    "com.oculus.auth.coreutil.AppVerifierUtils", p.classLoader);
-            if (verifier == null) {
-                log("Verifier class unavailable in process loader: " + p.processName);
-                return;
-            }
-            Method method = verifier.getDeclaredMethod("getSignatureFromPackageName", String.class);
-            Class<?> resultType = method.getReturnType();
-            // In the uploaded build this is X.0Xf(String). Resolve the actual type.
-            Constructor<?> constructor = resultType.getDeclaredConstructor(String.class);
-            if (resultType.getDeclaredField("sha256Hash").getType() != String.class ||
-                    !Modifier.isPublic(constructor.getModifiers())) {
-                throw new IllegalStateException("Unsupported signature-wrapper shape");
-            }
-            OverrideConfig config = new OverrideConfig(BuildConfig.CONFIG_PATH);
-            AtomicBoolean reportedError = new AtomicBoolean();
-            XC_MethodHook.Unhook unhook = XposedBridge.hookMethod(method, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!(param.args[0] instanceof String)) return;
-                    String packageName = (String) param.args[0];
-                    log("getSignatureFromPackageName entered; queriedPackage=" + packageName +
-                            "; pid=" + Process.myPid());
-                    try {
-                        // Re-read each query; config updates need no module rebuild.
-                        OverrideConfig.Document document = config.read();
-                        if (!document.hasPackage(packageName)) {
-                            log("No configured package match for " + packageName + "; using original method");
-                            return;
-                        }
-                        Object value = XposedHelpers.getObjectField(param.thisObject, "context");
-                        if (!(value instanceof Context)) throw new IllegalStateException("Missing verifier context");
-                        Context context = (Context) value;
-                        PackageInfo info = context.getPackageManager().getPackageInfo(packageName, 0);
-                        long version = info.getLongVersionCode();
-                        String hash = document.hashFor(packageName, version);
-                        if (hash == null) {
-                            log("No version match for " + packageName +
-                                    "; installed versionCode=" + version);
-                            reportedError.set(false);
-                            return;
-                        }
-                        Object result = constructor.newInstance(hash);
-                        if (!hash.equals(XposedHelpers.getObjectField(result, "sha256Hash"))) {
-                            throw new IllegalStateException("Signature wrapper did not retain configured hash");
-                        }
-                        param.setResult(result);
-                        reportedError.set(false);
-                        log("Returned configured signature for " + packageName +
-                                "; versionCode=" + version + "; app_signer=" + hash);
-                    } catch (Throwable error) {
-                        // Leave the original result/exception behavior intact on error.
-                        if (reportedError.compareAndSet(false, true)) {
-                            log("Configuration/lookup failed; using original method; " +
-                                    error.getClass().getSimpleName() + ": " + error.getMessage());
-                        }
-                    }
-                }
-            });
-            if (unhook == null) {
-                throw new IllegalStateException("Framework hookMethod returned null; hook was not installed");
-            }
-            installed = true;
-            log("v2.2 direct verifier hook installed in " + p.processName +
-                    "; config=" + BuildConfig.CONFIG_PATH + "; resultType=" + resultType.getName());
-            installTokenDiagnostics(p.classLoader);
-        } catch (Throwable error) {
-            Log.e("SigningInfoOverride", "Hook installation failed; overrides inactive", error);
-            log("Hook installation failed; overrides inactive");
-            XposedBridge.log(error);
-        }
-    }
-
-    private static void installTokenDiagnostics(ClassLoader loader) {
-        try {
-            Class<?> provider = XposedHelpers.findClassIfExists(
-                    "com.oculus.auth.components.TokenProvider", loader);
-            if (provider == null) {
-                log("TokenProvider unavailable in this loader; caller diagnostics inactive");
-                return;
-            }
-            // Vector/LSPosed extension: use reflection to retain compileOnly API 82.
-            Method deoptimize = null;
-            try {
-                deoptimize = XposedBridge.class.getDeclaredMethod("deoptimizeMethod", Member.class);
-            } catch (NoSuchMethodException unavailable) {
-                log("Framework deoptimizeMethod(Member) unavailable; inlining remains possible");
-            }
-            int callers = 0;
-            int traces = 0;
-            for (Method caller : provider.getDeclaredMethods()) {
-                String name = caller.getName();
-                if (!"obtainAccessToken".equals(name) && !"obtainToken".equals(name)) continue;
-                if (Modifier.isAbstract(caller.getModifiers()) || Modifier.isNative(caller.getModifiers())) continue;
-                if (deoptimize != null) {
-                    try {
-                        // Deoptimize before adding the diagnostic hook, so its backup
-                        // also uses the deoptimized body containing the signature call.
-                        deoptimize.invoke(null, caller);
-                        callers++;
-                        log("Deoptimization requested for TokenProvider." + name);
-                    } catch (Throwable error) {
-                        log("Caller deoptimization failed for " + name + "; exception=" +
-                                error.getClass().getSimpleName());
-                        XposedBridge.log(error);
-                    }
-                }
-                Class<?>[] args = caller.getParameterTypes();
-                if (!"obtainAccessToken".equals(name) || args.length != 6 ||
-                        args[0] != boolean.class || args[1] != String.class ||
-                        args[4] != String.class || args[5] != boolean.class) continue;
-                XC_MethodHook.Unhook trace = XposedBridge.hookMethod(caller, new XC_MethodHook() {
-                    @Override protected void beforeHookedMethod(MethodHookParam param) {
-                        // These are package arguments in the supplied Horizon build.
-                        // Do not log credentials, token objects, or all arguments.
-                        log("TokenProvider.obtainAccessToken entered; callingPackage=" + param.args[1] +
-                                "; metadataPackage=" + param.args[4] + "; pid=" + Process.myPid());
-                    }
-
-                    @Override protected void afterHookedMethod(MethodHookParam param) {
-                        if (param.hasThrowable()) {
-                            log("TokenProvider.obtainAccessToken exited with exception=" +
-                                    param.getThrowable().getClass().getName());
-                        } else {
-                            log("TokenProvider.obtainAccessToken exited; resultPresent=" +
-                                    (param.getResult() != null));
-                        }
-                    }
-                });
-                if (trace == null) {
-                    log("Framework rejected TokenProvider diagnostic hook");
-                } else {
-                    traces++;
-                    log("Read-only TokenProvider.obtainAccessToken trace installed");
-                }
-            }
-            log("TokenProvider diagnostics ready; deoptimizationRequests=" + callers + "; traces=" + traces);
-        } catch (Throwable error) {
-            log("Optional caller diagnostics failed; signature hook remains installed");
-            XposedBridge.log(error);
-        }
+    private static SigningInfo signingInfo(SigningInfo original, Signature[] signatures) throws Exception {
+        // Android 9-12: PackageParser.SigningDetails; Android 13+: SigningDetails.
+        Field field = SigningInfo.class.getDeclaredField("mSigningDetails");
+        field.setAccessible(true);
+        Class<?> detailsClass = field.getType();
+        Constructor<?> constructor = detailsClass.getDeclaredConstructor(Signature[].class, int.class);
+        constructor.setAccessible(true);
+        Object details = constructor.newInstance(signatures, 0 /* scheme unknown */);
+        field.set(original, details);
+        return original;
     }
 }
