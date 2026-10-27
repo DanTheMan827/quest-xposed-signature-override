@@ -3,6 +3,7 @@ package com.example.signinginfooverride;
 import android.content.Context;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Binder;
 import android.content.pm.PackageInfo;
 import android.content.pm.Signature;
 import android.content.pm.SigningInfo;
@@ -22,11 +23,34 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public final class SigningHook implements IXposedHookLoadPackage {
     private static boolean installed;
     private static volatile boolean verboseLogging;
+    private static volatile Context attachedContext;
+    private static boolean attachmentHook;
     private static final ThreadLocal<Boolean> inQuery = new ThreadLocal<>();
 
     @Override public synchronized void handleLoadPackage(XC_LoadPackage.LoadPackageParam p) {
         // Never capture substituted results or modify the system package database.
-        if (installed || BuildConfig.APPLICATION_ID.equals(p.packageName) || "android".equals(p.packageName)) return;
+        if (BuildConfig.APPLICATION_ID.equals(p.packageName) || "android".equals(p.packageName)) return;
+        if (!attachmentHook) {
+            XposedHelpers.findAndHookMethod(android.app.Application.class, "attach", Context.class, new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    if (param.hasThrowable()) return;
+                    attachedContext = (Context) param.args[0];
+                    refreshLogging();
+                    log("Module attached: version=" + BuildConfig.VERSION_NAME + "; package=" + p.packageName
+                            + "; process=" + p.processName);
+                    log("Asset adapters: Horizon=" + AssetStorageBridge.diagnosticStatus()
+                            + "; OCMS=" + OcmsAssetStorageHook.diagnosticStatus());
+                }
+            });
+            attachmentHook = true;
+        }
+        TokenSwapHook.install(p.classLoader);
+        EntitlementSwapHook.install(p.classLoader);
+        ContentSwapHook.install(p.classLoader);
+        LibrarySwapHook.install(p.classLoader);
+        AssetStorageBridge.install(p.classLoader);
+        OcmsAssetStorageHook.install(p.classLoader);
+        if (installed) return;
         Class<?> manager = XposedHelpers.findClassIfExists("android.app.ApplicationPackageManager", p.classLoader);
         if (manager == null) return;
         XC_MethodHook hook = new XC_MethodHook() {
@@ -64,6 +88,7 @@ public final class SigningHook implements IXposedHookLoadPackage {
     @SuppressWarnings("deprecation")
     private static PackageInfo replace(PackageInfo original) {
         if (original.packageName == null || BuildConfig.APPLICATION_ID.equals(original.packageName)) return original;
+        if (original.signatures == null && original.signingInfo == null) return original;
         try {
             byte[] pem = certificate(original.packageName, original.getLongVersionCode());
             if (pem == null) {
@@ -83,7 +108,8 @@ public final class SigningHook implements IXposedHookLoadPackage {
             if (copy.signatures != null) copy.signatures = replacements;
             if (copy.signingInfo != null) copy.signingInfo = signingInfo(copy.signingInfo, replacements);
             log("Applied override for " + original.packageName + "+" + original.getLongVersionCode()
-                    + "; current signers=" + replacements.length);
+                    + "; current signers=" + replacements.length + "; first certificate SHA-256="
+                    + OverrideFiles.fingerprint(certificates.get(0)));
             return copy;
         } catch (Throwable error) {
             log("Lookup failed for " + original.packageName + ": " + error);
@@ -99,30 +125,48 @@ public final class SigningHook implements IXposedHookLoadPackage {
         Context context = currentContext();
         if (context == null) return null;
         log("Reading PEM through companion: " + filename);
-        Bundle result = context.getContentResolver().call(
-                Uri.parse("content://" + BuildConfig.APPLICATION_ID + ".certificates"),
-                "certificate", filename, null);
-        return result == null ? null : result.getByteArray("pem");
+        Bundle result = companionCall("certificate", filename, null);
+        if (result == null) return null;
+        log("Signature data for " + filename + " from " + result.getString("certificatePackage") + "+"
+                + result.getLong("certificateVersion") + " (" + result.getString("certificateOrigin") + ")");
+        return result.getByteArray("pem");
     }
 
-    private static Context currentContext() {
-        return (Context) XposedHelpers.callStaticMethod(
+    static Context currentContext() {
+        Context application = (Context) XposedHelpers.callStaticMethod(
                 XposedHelpers.findClass("android.app.ActivityThread", null), "currentApplication");
+        return application != null ? application : attachedContext;
     }
 
-    private static void refreshLogging() {
+    static void refreshLogging() {
         // Re-read for each query so the switch works in already-running scoped apps.
         // Missing settings, a missing companion or IPC failure always disables logging.
         try {
-            Context context = currentContext();
-            Bundle settings = context == null ? null : context.getContentResolver().call(
-                    Uri.parse("content://" + BuildConfig.APPLICATION_ID + ".certificates"), "settings", null, null);
-            verboseLogging = settings != null && settings.getBoolean(ModuleSettings.VERBOSE_LOGGING, false);
+            Bundle settings = companionCall("settings", null, null);
+            updateLogging(settings);
         } catch (Throwable unavailable) { verboseLogging = false; }
     }
 
-    private static void log(String message) {
-        if (verboseLogging) XposedBridge.log("SigningInfoOverride: " + message);
+    static Bundle companionCall(String method, String argument, Bundle extras) {
+        Context context = currentContext();
+        if (context == null) return null;
+        // Binder service callbacks must query preferences as the service process, then restore the real caller.
+        long identity = Binder.clearCallingIdentity();
+        try {
+            return context.getContentResolver().call(Uri.parse("content://" + BuildConfig.APPLICATION_ID + ".certificates"),
+                    method, argument, extras);
+        } finally { Binder.restoreCallingIdentity(identity); }
+    }
+
+    static void updateLogging(Bundle settings) {
+        verboseLogging = settings != null && settings.getBoolean(ModuleSettings.VERBOSE_LOGGING, false);
+    }
+
+    static void log(String message) {
+        if (verboseLogging) {
+            XposedBridge.log("SigningInfoOverride: " + message);
+            android.util.Log.d("SigningInfoOverride", message);
+        }
     }
 
     private static SigningInfo signingInfo(SigningInfo original, Signature[] signatures) throws Exception {

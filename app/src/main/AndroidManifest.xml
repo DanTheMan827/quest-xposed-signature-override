@@ -11,6 +11,7 @@
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data android:name="xposeddescription" android:value="Per-package, per-version public signing certificate overrides" />
         <meta-data android:name="xposedminversion" android:value="82" />
+        <meta-data android:name="xposedscope" android:value="com.oculus.horizon;com.oculus.ocms" />
         <provider android:name=".OverrideProvider"
             android:authorities="${applicationId}.certificates" android:exported="true" />
         <activity android:name=".MainActivity" android:exported="true"

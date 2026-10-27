@@ -27,17 +27,20 @@ public final class MainActivity extends Activity {
     private LinearLayout rows, details;
     private TextView status, count;
     private EditText search;
-    private Button overridesButton, appsButton;
-    private boolean installedTab, busy, storagePromptShown;
+    private AppSelector installedSelector;
+    private ScrollView flatList;
+    private Button overridesButton, appsButton, swapsButton, addSwapButton;
+    private boolean installedTab, swapTab, busy, storagePromptShown;
     private int generation;
     private Item selected;
 
     private static final class Item {
-        String title, packageName, filename, error, versionName;
+        String title, packageName, filename, error, versionName, targetPackage;
         long version;
+        AppCatalog.Entry app;
         List<X509Certificate> certificates = new ArrayList<>();
         int signerCount;
-        boolean installed;
+        boolean installed, swap;
     }
 
     @Override public void onCreate(Bundle state) {
@@ -45,6 +48,7 @@ public final class MainActivity extends Activity {
         store = new OverrideStore(this);
         if (state != null) {
             installedTab = state.getBoolean("installedTab");
+            swapTab = state.getBoolean("swapTab");
             storagePromptShown = state.getBoolean("storagePromptShown");
         }
         buildUi();
@@ -66,6 +70,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putBoolean("installedTab", installedTab);
+        state.putBoolean("swapTab", swapTab);
         state.putBoolean("storagePromptShown", storagePromptShown);
         super.onSaveInstanceState(state);
     }
@@ -73,10 +78,13 @@ public final class MainActivity extends Activity {
     private void buildUi() {
         LinearLayout page = column(); page.setPadding(dp(28), dp(22), dp(28), dp(20)); page.setBackgroundColor(BG);
         TextView title = text("Signature Overrides", 28, TEXT); title.setTypeface(null, Typeface.BOLD); page.addView(title);
-        page.addView(text("Public signing certificates  /  exact package + version matches", 15, MUTED));
+        page.addView(text("Public signing certificates  /  bundle ID swaps", 15, MUTED));
         LinearLayout toolbar = row(); toolbar.setPadding(0, dp(14), 0, dp(12));
         overridesButton = button("Available overrides", () -> switchTab(false)); toolbar.addView(overridesButton);
         appsButton = button("Capture installed app", () -> switchTab(true)); toolbar.addView(appsButton);
+        swapsButton = button("Bundle ID swaps", this::switchSwaps); toolbar.addView(swapsButton);
+        addSwapButton = button("Add swap", () -> { selected = null; renderRows(); showSwapEditor(null); });
+        addSwapButton.setVisibility(View.GONE); toolbar.addView(addSwapButton);
         toolbar.addView(button("Refresh", this::load));
         toolbar.addView(button("File access", this::fileAccess));
         Switch logging = new Switch(this); logging.setText("Verbose module logging");
@@ -84,7 +92,7 @@ public final class MainActivity extends Activity {
         logging.setChecked(ModuleSettings.verboseLogging(this));
         logging.setOnCheckedChangeListener((b, checked) -> {
             ModuleSettings.preferences(this).edit().putBoolean(ModuleSettings.VERBOSE_LOGGING, checked).apply();
-            status.setText(checked ? "Verbose module logging enabled for subsequent package queries" : "Module logging disabled");
+            status.setText(checked ? "Verbose module logging enabled for subsequent package, token and library queries" : "Module logging disabled");
         });
         toolbar.addView(logging);
         HorizontalScrollView toolbarScroll = new HorizontalScrollView(this); toolbarScroll.addView(toolbar);
@@ -94,8 +102,13 @@ public final class MainActivity extends Activity {
         search = new EditText(this); search.setSingleLine(true); search.setTextColor(TEXT); search.setHintTextColor(MUTED);
         search.setHint("Search app, package or version"); search.setTextSize(17); search.setMinHeight(dp(56)); sidebar.addView(search);
         count = text("", 14, MUTED); count.setPadding(dp(8), dp(8), 0, dp(8)); sidebar.addView(count);
-        ScrollView list = new ScrollView(this); list.setFillViewport(true); rows = column(); list.addView(rows);
-        sidebar.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
+        flatList = new ScrollView(this); flatList.setFillViewport(true); rows = column(); flatList.addView(rows);
+        sidebar.addView(flatList, new LinearLayout.LayoutParams(-1, 0, 1));
+        installedSelector = new AppSelector(this); installedSelector.setVisibility(View.GONE);
+        installedSelector.setOnSelected(app -> {
+            for (Item item : items) if (item.installed && item.packageName.equals(app.packageName)) { select(item); return; }
+        });
+        sidebar.addView(installedSelector, new LinearLayout.LayoutParams(-1, 0, 1));
         body.addView(sidebar, new LinearLayout.LayoutParams(0, -1, 0.43f));
         ScrollView detailScroll = new ScrollView(this); detailScroll.setBackground(card(PANEL)); detailScroll.setFillViewport(true);
         details = column(); details.setPadding(dp(28), dp(24), dp(28), dp(24)); detailScroll.addView(details);
@@ -116,25 +129,37 @@ public final class MainActivity extends Activity {
         emptyDetails();
     }
 
-    private void switchTab(boolean installed) { installedTab = installed; selected = null; search.setText(""); load(); }
+    private void switchTab(boolean installed) { installedTab = installed; swapTab = false; selected = null; search.setText(""); load(); }
+
+    private void switchSwaps() { swapTab = true; installedTab = false; selected = null; search.setText(""); load(); }
 
     private void load() {
         if (isFinishing() || busy) return;
         final int request = ++generation;
         final boolean apps = installedTab;
+        final boolean swaps = swapTab;
         busy = true; status.setText("Loading…");
-        overridesButton.setEnabled(apps); appsButton.setEnabled(!apps);
+        overridesButton.setEnabled(apps || swaps); appsButton.setEnabled(!apps || swaps); swapsButton.setEnabled(!swaps);
+        addSwapButton.setVisibility(swaps ? View.VISIBLE : View.GONE);
+        search.setHint(swaps ? "Search source or presented bundle ID" : "Search app, package or version");
+        installedSelector.setVisibility(apps ? View.VISIBLE : View.GONE);
+        search.setVisibility(apps ? View.GONE : View.VISIBLE); count.setVisibility(apps ? View.GONE : View.VISIBLE);
+        flatList.setVisibility(apps ? View.GONE : View.VISIBLE);
+        if (apps) installedSelector.showMessage("Loading installed apps…");
         worker.execute(() -> {
             List<Item> loaded = new ArrayList<>(); String failure = null;
             try {
-                if (apps) {
-                    for (PackageInfo info : getPackageManager().getInstalledPackages(0)) {
-                        Item item = new Item(); item.installed = true; item.packageName = info.packageName;
-                        item.title = info.applicationInfo == null ? info.packageName : info.applicationInfo.loadLabel(getPackageManager()).toString();
-                        item.version = info.getLongVersionCode(); item.versionName = info.versionName;
+                if (swaps) {
+                    for (Map.Entry<String, String> entry : SwapStore.read(this).entrySet()) {
+                        Item item = new Item(); item.swap = true; item.title = entry.getKey();
+                        item.packageName = entry.getKey(); item.targetPackage = entry.getValue(); loaded.add(item);
+                    }
+                } else if (apps) {
+                    for (AppCatalog.Entry app : AppSelector.query(getPackageManager())) {
+                        Item item = new Item(); item.installed = true; item.packageName = app.packageName;
+                        item.title = app.label; item.version = app.version; item.versionName = app.versionName; item.app = app;
                         loaded.add(item);
                     }
-                    loaded.sort(Comparator.comparing(i -> i.title.toLowerCase(Locale.ROOT)));
                 } else {
                     for (String filename : store.names()) {
                         Item item = new Item(); item.filename = filename; item.title = filename;
@@ -151,33 +176,49 @@ public final class MainActivity extends Activity {
             runOnUiThread(() -> {
                 busy = false;
                 if (request != generation || isDestroyed()) return;
-                if (apps != installedTab) { load(); return; }
-                items.clear(); items.addAll(loaded); selected = null; renderRows(); emptyDetails();
-                status.setText(error == null ? BuildConfig.OVERRIDE_DIRECTORY + "  •  " + (apps ? "Choose an app to inspect its signer" : "Changes apply on the next uncached package query")
-                        : "Folder unavailable: " + error + "  •  Use File access to grant storage permission, then refresh.");
+                if (apps != installedTab || swaps != swapTab) { load(); return; }
+                items.clear(); items.addAll(loaded); selected = null;
+                if (apps) {
+                    List<AppCatalog.Entry> entries = new ArrayList<>();
+                    for (Item item : loaded) entries.add(item.app);
+                    installedSelector.setApps(entries);
+                }
+                renderRows(); emptyDetails();
+                if (apps && error != null) installedSelector.showMessage("Cannot load installed apps: " + error);
+                if (error != null) status.setText(swaps ? "Cannot load bundle ID swaps: " + error
+                        : apps ? "Cannot load installed apps: " + error : "Folder unavailable: " + error + "  •  Use File access to grant storage permission, then refresh.");
+                else status.setText(swaps ? "Exact, one-way swaps  •  Saved privately in this app  •  Applied on subsequent token, library and content requests"
+                        : BuildConfig.OVERRIDE_DIRECTORY + "  •  " + (apps ? "Choose an app to inspect its signer" : "Changes apply on the next uncached package query"));
             });
         });
     }
 
     private void renderRows() {
         if (rows == null) return;
+        if (installedTab && !swapTab) {
+            installedSelector.setSelectedPackage(selected == null ? null : selected.packageName);
+            return;
+        }
         rows.removeAllViews(); int shown = 0;
         String query = search.getText().toString().toLowerCase(Locale.ROOT).trim();
         for (Item item : items) {
-            String searchable = item.title + " " + item.packageName + " " + item.version;
+            String searchable = item.title + " " + item.packageName + " " + item.version + " " + item.targetPackage;
             if (!searchable.toLowerCase(Locale.ROOT).contains(query)) continue;
             shown++;
-            Button entry = button(item.title + "\n" + (item.installed ? item.packageName + "  •  " : "")
-                    + "Version " + item.version + (item.error == null ? "" : "  •  Invalid PEM"), () -> select(item));
+            String label = item.swap ? item.packageName + "\n→ " + item.targetPackage : item.title + "\n"
+                    + (item.installed ? item.packageName + "  •  " : "") + "Version " + item.version
+                    + (item.error == null ? "" : "  •  Invalid PEM");
+            Button entry = button(label, () -> select(item));
             entry.setAllCaps(false); entry.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); entry.setTextSize(16);
             entry.setPadding(dp(16), dp(14), dp(16), dp(14)); entry.setBackground(card(selected == item ? 0xff294e59 : PANEL));
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2); params.bottomMargin = dp(8); rows.addView(entry, params);
         }
-        count.setText(shown + (installedTab ? " installed apps" : " overrides"));
-        if (shown == 0) rows.addView(text(query.isEmpty() ? (installedTab ? "No visible installed apps." : "No overrides yet. Capture an installed app to get started.") : "No matches.", 17, MUTED));
+        count.setText(shown + (swapTab ? " bundle ID swaps" : installedTab ? " installed apps" : " overrides"));
+        if (shown == 0) rows.addView(text(query.isEmpty() ? (swapTab ? "No swaps yet. Add a source and presented bundle ID on the right." : installedTab ? "No visible installed apps." : "No overrides yet. Capture an installed app to get started.") : "No matches.", 17, MUTED));
     }
 
     private void emptyDetails() {
+        if (swapTab) { showSwapEditor(null); return; }
         details.removeAllViews(); details.addView(text(installedTab ? "Capture a signing certificate" : "Your signature library", 25, TEXT));
         detail("", installedTab ? "Select an installed app on the left. Its public signing certificate can be saved without backing up the app or reading its private data."
                 : "Select an override to see its signer, certificate validity and SHA-256 fingerprint.");
@@ -187,6 +228,7 @@ public final class MainActivity extends Activity {
 
     private void select(Item item) {
         selected = item; renderRows();
+        if (item.swap) { showSwapEditor(item); return; }
         if (!item.installed) { showDetails(item); return; }
         details.removeAllViews(); details.addView(text("Reading signer…", 24, TEXT));
         worker.execute(() -> {
@@ -265,6 +307,88 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> { busy = false; status.setText("Saved " + item.filename); });
             } catch (Exception e) { runOnUiThread(() -> { busy = false; status.setText("Capture failed: " + message(e)); }); }
         });
+    }
+
+    private void showSwapEditor(Item item) {
+        details.removeAllViews();
+        details.addView(text(item == null ? "Add bundle ID swap" : "Edit bundle ID swap", 25, TEXT));
+        detail("Source bundle ID", "The original package ID used by token, library and supported platform content requests.");
+        EditText source = packageInput("org.example.source", item == null ? "" : item.packageName);
+        details.addView(packagePickerRow(source, "Choose source app"));
+        detail("Presented bundle ID", "The destination ID to send instead of the source ID.");
+        EditText target = packageInput("org.example.destination", item == null ? "" : item.targetPackage); details.addView(packagePickerRow(target, "Choose destination app"));
+        details.addView(button(item == null ? "Save swap" : "Save changes", () -> {
+            String from = source.getText().toString().trim(), to = target.getText().toString().trim();
+            try { PackageSwaps.pair(from, to); }
+            catch (IllegalArgumentException invalid) { target.setError(message(invalid)); return; }
+            saveSwap(item == null ? null : item.packageName, from, to);
+        }));
+        if (item != null) details.addView(button("Remove swap", () -> new AlertDialog.Builder(this)
+                .setTitle("Remove bundle ID swap?").setMessage(item.packageName + " → " + item.targetPackage)
+                .setNegativeButton("Cancel", null).setPositiveButton("Remove", (d, w) -> removeSwap(item.packageName)).show()));
+        detail("Certificate priority", "An exact source ID + installed version PEM takes priority. Otherwise use the destination's matching PEM or installed current signer. The presented ID and resolved signer change together.");
+        detail("If the destination is not installed", "An exact source override is sufficient. Otherwise provide a destination PEM matching the request version. Missing or ambiguous signing data leaves the request unchanged.");
+        detail("Matching", "Exact IDs only, one swap per source. Swaps are applied once to token requests and supported library lookups, including entitlement requests. They do not rename installed apps. Editing swaps does not need storage permission.");
+    }
+
+    private LinearLayout packagePickerRow(EditText input, String title) {
+        LinearLayout field = row();
+        field.addView(input, new LinearLayout.LayoutParams(0, -2, 1));
+        field.addView(button("Pick app", () -> AppSelector.showPicker(this, title, input.getText().toString(), worker, app -> {
+            input.setText(app.packageName); input.setSelection(input.length());
+        })));
+        return field;
+    }
+
+    private EditText packageInput(String hint, String value) {
+        EditText input = new EditText(this); input.setSingleLine(true); input.setTextSize(17); input.setTextColor(TEXT);
+        input.setHintTextColor(MUTED); input.setHint(hint); input.setText(value); input.setMinHeight(dp(56));
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        return input;
+    }
+
+    private void saveSwap(String previousSource, String source, String target) {
+        if (busy) return;
+        busy = true; status.setText("Checking swap…");
+        worker.execute(() -> {
+            try {
+                String previous = SwapStore.read(this).get(source);
+                runOnUiThread(() -> {
+                    busy = false; if (isDestroyed()) return;
+                    if (previous != null && !previous.equals(target)) new AlertDialog.Builder(this)
+                            .setTitle("Update existing swap?").setMessage(source + " currently presents " + previous + ". Change it to " + target + "?")
+                            .setNegativeButton("Cancel", null).setPositiveButton("Update", (d, w) -> persistSwap(previousSource, source, target)).show();
+                    else persistSwap(previousSource, source, target);
+                });
+            } catch (Exception error) { swapFailure(error); }
+        });
+    }
+
+    private void persistSwap(String previousSource, String source, String target) {
+        if (busy) return;
+        busy = true; status.setText("Saving swap…");
+        worker.execute(() -> {
+            try {
+                SwapStore.save(this, previousSource, source, target);
+                runOnUiThread(() -> { busy = false; if (!isDestroyed()) load(); });
+            } catch (Exception error) { swapFailure(error); }
+        });
+    }
+
+    private void removeSwap(String source) {
+        if (busy) return;
+        busy = true; status.setText("Removing swap…");
+        worker.execute(() -> {
+            try {
+                SwapStore.remove(this, source);
+                runOnUiThread(() -> { busy = false; if (!isDestroyed()) load(); });
+            } catch (Exception error) { swapFailure(error); }
+        });
+    }
+
+    private void swapFailure(Exception error) {
+        runOnUiThread(() -> { busy = false; if (!isDestroyed()) status.setText("Swap change failed: " + message(error)); });
     }
 
     private void fileAccess() {
