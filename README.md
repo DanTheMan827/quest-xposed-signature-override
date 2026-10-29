@@ -30,20 +30,6 @@ Before installing, ensure your Meta Quest device meets the following requirement
 
 ---
 
-## 📥 Installation
-
-1. Download the latest release APK from the [Releases](../../releases) page.
-2. Install the APK onto your Meta Quest device using ADB:
-```bash
-adb install quest-xposed-signature-override.apk
-```
-3. Open your Xposed Manager app (e.g., **LSPosed**).
-4. Navigate to the **Modules** tab and enable **Quest Xposed Signature Override**.
-5. Set the module scope to **System Framework** (`android`) and any target packages if applicable.
-6. **Reboot** your headset for the hooks to take effect.
-
----
-
 ## 🏗️ Building From Source
 
 If you want to build the module yourself, follow these steps:
